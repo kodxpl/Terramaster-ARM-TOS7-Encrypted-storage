@@ -10,7 +10,7 @@
 #  does not matter whether TOS names an array md1, md2, md127 ...
 #  An open array /dev/mdN is always mapped as /dev/mapper/cryptN.
 # =============================================================================
-KIT_VERSION=2026-10-25
+KIT_VERSION=2026-11-22
 set -e
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 
@@ -670,715 +670,377 @@ echo "Copy the header backup OFF the NAS now. Then run /opt/lvmshim/check.sh"
 EOF_CONV
 
 # -----------------------------------------------------------------------------
-chmod 755 $D/*.sh $D/*-shim $D/log $D/unlock-web.py
-[ -f $D/settings.conf ] || cp $D/settings.conf.default $D/settings.conf
-
-# self-signed certificate for the browser unlock page (kept across re-installs)
-if [ ! -s $D/tls/cert.pem ]; then
-  mkdir -p $D/tls && chmod 700 $D/tls
-  if command -v openssl >/dev/null; then
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$(hostname)" \
-      -keyout $D/tls/key.pem -out $D/tls/cert.pem >/dev/null 2>&1 && chmod 600 $D/tls/key.pem
-  else
-    echo "WARNING: openssl not found - browser unlock page disabled (SSH unlock still works)"
-  fi
-fi
-touch $D/pools.conf
-grep -q '^#' $D/pools.conf || sed -i '1i # md UUIDs (mdadm format) of LUKS-encrypted pools, one per line' $D/pools.conf
-
-cat > /etc/systemd/system/luks-pools.service <<'EOF_UNIT'
-[Unit]
-Description=Wait for LUKS unlock of encrypted md pools before TOS storage
-After=ssh.service network.target
-Before=tnas-mntfc.service tnas-mntdata.service StorageManager.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-TimeoutStartSec=infinity
-ExecStart=/opt/lvmshim/wait-unlock.sh
-
-[Install]
-WantedBy=tnas-system.target
-EOF_UNIT
-
-# keep a copy of this installer next to the data (survives firmware updates of /opt)
-cp -f "$0" /root/luks-pools/luks-kit-install.sh 2>/dev/null || true
-
-systemctl daemon-reload
-$D/install-shims.sh
-[ -s $D/tls/cert.pem ] && echo "Unlock page certificate $(openssl x509 -noout -fingerprint -sha256 -in $D/tls/cert.pem)"
-echo "$KIT_VERSION" > $D/VERSION
-echo "Kit version $KIT_VERSION installed to $D. Unit: luks-pools.service ($(systemctl is-enabled luks-pools.service 2>/dev/null || echo disabled))"#!/bin/bash
-# =============================================================================
-#  luks-kit-install.sh  -  LUKS directly on TOS md RAID (md -> LUKS -> PV -> VG)
-#  TerraMaster TOS 7 (tested on F4-212, TOS_ARM2.0_6.0.587)
+cat > $D/tnas-luks.sh <<'EOF_MENU'
+#!/bin/bash
+# tnas-luks.sh - menu-driven manager for LUKS-encrypted storage pools on TerraMaster TOS 7
 #
-#  Installs / updates everything in /opt/lvmshim and the boot unit
-#  luks-pools.service. Safe to re-run (idempotent). Does NOT touch any disk.
-#
-#  Encrypted arrays are listed by md UUID in /opt/lvmshim/pools.conf, so it
-#  does not matter whether TOS names an array md1, md2, md127 ...
-#  An open array /dev/mdN is always mapped as /dev/mapper/cryptN.
-# =============================================================================
-KIT_VERSION=2026-10-25
-set -e
-[ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+# Front end for the luks-kit (/opt/lvmshim, installed by luks-kit-install.sh).
+# Layout of an encrypted pool:  md RAID -> LUKS (cryptN) -> LVM PV/VG/LV -> btrfs
+# Destructive actions ask you to type the array name; nothing is changed before that.
 
-D=/opt/lvmshim
-[ -d $D ] && cp -a $D /root/lvmshim.bak.$(date +%Y%m%d-%H%M%S)
-mkdir -p $D /root/luks-pools
+KIT=${LUKS_KIT:-/opt/lvmshim}
+LVM=${LVM_BIN:-/usr/sbin/lvm}            # the real LVM tool (no shim translation)
 
-# -----------------------------------------------------------------------------
-cat > $D/common.sh <<'EOF_COMMON'
-#!/bin/bash
-# shared helpers
-POOLS_CONF=/opt/lvmshim/pools.conf
-STATE_DIR=/root/luks-pools
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLD=$'\e[1m'; DIM=$'\e[2m'; RST=$'\e[0m'
+die()  { echo "${RED}$*${RST}" >&2; exit 1; }
+err()  { echo "${RED}$*${RST}" >&2; }
+ok()   { echo "${GRN}$*${RST}"; }
+warn() { echo "${YEL}$*${RST}"; }
+confirm() { local r; read -rp "$1? [y/N]: " r; [[ $r =~ ^[yY]$ ]]; }
 
-# md UUIDs of encrypted pools (one per line in pools.conf)
-pool_uuids(){ grep -vE '^[[:space:]]*(#|$)' "$POOLS_CONF" 2>/dev/null | awk '{print $1}'; }
+[[ $EUID -eq 0 ]] || die "Run as root."
+[[ -r $KIT/common.sh ]] || die "luks-kit not installed ($KIT missing). Run luks-kit-install.sh first."
+# shellcheck source=/dev/null
+. "$KIT/common.sh"
+command -v cryptsetup >/dev/null || die "cryptsetup not found."
 
-# device name TOS uses for this array, from the mdadm config (e.g. /dev/md1)
-md_conf_name(){
-  local f
-  for f in /etc/mdadm/mdadm.conf /etc/mdadm.conf; do
-    [ -r "$f" ] && awk -v u="UUID=$1" '$1=="ARRAY" && index($0,u){print $2; exit}' "$f"
-  done | head -1
+# ---------------------------------------------------------------- helpers ---
+
+ini_get() {   # file section key
+    awk -v s="[$2]" -v k="$3" '
+        /^\[/ { in_s = ($0 == s); next }
+        in_s { split($0, a, "="); key=a[1]; gsub(/[ \t]/, "", key)
+               if (key == k) { v=substr($0, index($0, "=")+1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit } }' "$1" 2>/dev/null
 }
 
-# active md device carrying this UUID (empty if not assembled)
-md_active_dev(){
-  local d
-  for d in /dev/md[0-9]*; do
-    [ -b "$d" ] || continue
-    [ "$(mdadm --detail --export "$d" 2>/dev/null | sed -n 's/^MD_UUID=//p')" = "$1" ] && { echo "$d"; return 0; }
-  done
-  return 1
-}
-
-# make sure the array is assembled (under the name TOS expects); print device
-md_ensure(){
-  local d
-  d=$(md_active_dev "$1") && { echo "$d"; return 0; }
-  d=$(md_conf_name "$1")
-  if [ -n "$d" ]; then mdadm --assemble --run "$d" --uuid="$1" >&2 || return 1
-  else mdadm --assemble --scan --run --uuid="$1" >&2 || return 1; fi
-  md_active_dev "$1"
-}
-
-# at least one member disk of this array is in the NAS (or the array is running)
-md_members_present(){ md_active_dev "$1" >/dev/null || mdadm --examine --scan 2>/dev/null | grep -qi "UUID=$1"; }
-
-# pools from pools.conf whose disks are present; pools with all disks removed are skipped
-present_uuids(){ local u; for u in $(pool_uuids); do md_members_present "$u" && echo "$u"; done; }
-
-crypt_name(){ echo "crypt${1#/dev/md}"; }      # /dev/md2 -> crypt2
-header_file(){ echo "$STATE_DIR/${1//:/-}-header.img"; }
-EOF_COMMON
-
-# -----------------------------------------------------------------------------
-cat > $D/lvm-shim <<'EOF_LVM'
-#!/bin/bash
-# Wraps every LVM command. While /dev/mapper/cryptN is open:
-#  - argument /dev/mdN  -> /dev/mapper/cryptN
-#  - output /dev/mapper/cryptN -> /dev/mdN
-#  - device hints in /etc/lvm/backup/* rewritten to /dev/mdN
-#    (StorageManager maps VG -> md from those hints)
-cmd=$(basename "$0")
-args=()
-for a in "$@"; do
-  if [[ $a =~ ^/dev/md([0-9]+)$ ]] && [ -b "/dev/mapper/crypt${BASH_REMATCH[1]}" ]; then
-    n=${BASH_REMATCH[1]}
-    [ "$cmd" = pvresize ] && cryptsetup resize "crypt$n"
-    a="/dev/mapper/crypt$n"
-  fi
-  args+=("$a")
-done
-fix(){ sed -E 's#/dev/mapper/crypt([0-9]+)#/dev/md\1#g'; }
-fixbak(){
-  grep -l 'device = "/dev/mapper/crypt[0-9]' /etc/lvm/backup/* 2>/dev/null \
-    | xargs -r sed -i -E 's#(device = ")/dev/mapper/crypt([0-9]+)"#\1/dev/md\2"#'
-}
-if [ -e /opt/lvmshim/DEBUG ]; then
-  out=$(/usr/sbin/lvm "$cmd" "${args[@]}" | fix; exit ${PIPESTATUS[0]}); rc=$?
-  fixbak
-  /opt/lvmshim/log "$cmd" "$rc" "$out" "$@"
-  [ -n "$out" ] && printf '%s\n' "$out"; exit $rc
-fi
-/usr/sbin/lvm "$cmd" "${args[@]}" | fix
-rc=${PIPESTATUS[0]}
-fixbak
-exit $rc
-EOF_LVM
-
-# -----------------------------------------------------------------------------
-cat > $D/blkid-shim <<'EOF_BLKID'
-#!/bin/bash
-# blkid: an open /dev/mdN is reported with the type of what is inside (LVM2_member)
-REAL=/usr/sbin/blkid.real
-ls /dev/mapper/crypt[0-9]* &>/dev/null || exec $REAL "$@"
-args=(); devs=0
-for a in "$@"; do
-  if [[ $a =~ ^/dev/md([0-9]+)$ ]]; then
-    devs=1; [ -b "/dev/mapper/crypt${BASH_REMATCH[1]}" ] && a="/dev/mapper/crypt${BASH_REMATCH[1]}"
-  elif [[ $a == /dev/* && $a != /dev/null ]]; then devs=1; fi
-  args+=("$a")
-done
-open=$(ls /dev/mapper/ | sed -n 's/^crypt\([0-9][0-9]*\)$/md\1/p' | paste -sd'|')
-doit(){
-  if [ $devs -eq 0 ]; then
-    $REAL "${args[@]}" | grep -Ev "^/dev/(${open}):" | sed -E 's#^/dev/mapper/crypt([0-9]+):#/dev/md\1:#'
-    return ${PIPESTATUS[0]}
-  fi
-  $REAL "${args[@]}" | sed -E 's#/dev/mapper/crypt([0-9]+)#/dev/md\1#g'
-  return ${PIPESTATUS[0]}
-}
-if [ -e /opt/lvmshim/DEBUG ]; then
-  out=$(doit); rc=$?
-  /opt/lvmshim/log blkid $rc "$out" "$@"
-  [ -n "$out" ] && printf '%s\n' "$out"; exit $rc
-fi
-doit; exit $?
-EOF_BLKID
-
-# -----------------------------------------------------------------------------
-cat > $D/lsblk-shim <<'EOF_LSBLK'
-#!/bin/bash
-# lsblk: hide the crypt layer from TOS (JSON tree and single-column queries)
-REAL=/usr/bin/lsblk.real
-ls /dev/mapper/crypt[0-9]* &>/dev/null || exec $REAL "$@"
-json=0; nohead=0; nodeps=0; col=""; md=""; ndev=0; prev=""
-for a in "$@"; do
-  case "$a" in
-    --json) json=1 ;; --noheadings) nohead=1 ;; --nodeps) nodeps=1 ;;
-    --output=*) col="${a#--output=}" ;;
-    --*) ;;
-    -*) [[ $a == *J* ]] && json=1; [[ $a == *n* ]] && nohead=1; [[ $a == *d* ]] && nodeps=1 ;;
-    /dev/*) ndev=$((ndev+1)); [[ $a =~ ^/dev/md([0-9]+)$ ]] && [ -b "/dev/mapper/crypt${BASH_REMATCH[1]}" ] && md="${BASH_REMATCH[1]}" ;;
-    *) [[ $prev == -o || $prev == --output || $prev =~ ^-[a-zA-Z]*o$ ]] && col="$a" ;;
-  esac
-  prev="$a"
-done
-doit(){
-  local o r inner
-  if [ $json -eq 1 ]; then
-    $REAL "$@" | python3 /opt/lvmshim/lsblk-json.py; return ${PIPESTATUS[0]}
-  fi
-  if [ -z "$md" ]; then $REAL "$@"; return $?; fi
-  if [ $ndev -ne 1 ] || [[ -z $col || $col == *,* ]]; then
-    mkdir -p /run/lvmshim; echo "$(date +%F_%T) passthrough: lsblk $*" >> /run/lvmshim/unhandled.log
-    $REAL "$@"; return $?
-  fi
-  o=$($REAL "$@"); r=$?
-  if [ "${col^^}" = FSTYPE ]; then inner=$($REAL -dno FSTYPE /dev/mapper/crypt$md); else inner=""; fi
-  echo "$o" | awk -v h=$nohead -v d=$nodeps -v isfs="${col^^}" -v inner="$inner" '
-    BEGIN{mdrow = (h ? 1 : 2)}
-    NR < mdrow {print; next}
-    NR == mdrow {print (isfs=="FSTYPE" ? inner : $0); next}
-    NR == mdrow+1 && !d {next}
-    {print}'
-  return $r
-}
-if [ -e /opt/lvmshim/DEBUG ]; then
-  out=$(doit "$@"); rc=$?
-  /opt/lvmshim/log lsblk $rc "$out" "$@"
-  [ -n "$out" ] && printf '%s\n' "$out"; exit $rc
-fi
-doit "$@"; exit $?
-EOF_LSBLK
-
-# -----------------------------------------------------------------------------
-cat > $D/lsblk-json.py <<'EOF_JSON'
-import json, sys, os
-raw = sys.stdin.read()
-try:
-    d = json.loads(raw)
-except Exception:
-    sys.stdout.write(raw); sys.exit(0)
-def nm(n):
-    return os.path.basename(n.get('name') or n.get('kname') or '')
-def fix(nodes):
-    for n in nodes:
-        ch = n.get('children') or []
-        base = nm(n)
-        if base.startswith('md') and base[2:].isdigit():
-            for c in list(ch):
-                if nm(c) == 'crypt' + base[2:]:
-                    if 'fstype' in n:
-                        n['fstype'] = c.get('fstype')
-                    ch.remove(c)
-                    ch.extend(c.get('children') or [])
-            if ch: n['children'] = ch
-            else: n.pop('children', None)
-        if n.get('children'):
-            fix(n['children'])
-fix(d.get('blockdevices', []))
-print(json.dumps(d, indent=3))
-EOF_JSON
-
-# -----------------------------------------------------------------------------
-cat > $D/log <<'EOF_LOG'
-#!/bin/bash
-# debug logger, active only while /opt/lvmshim/DEBUG exists
-cmd=$1; rc=$2; out=$3; shift 3
-p1=$(awk '{print $4}' /proc/$PPID/stat 2>/dev/null); p2=$(awk '{print $4}' /proc/$p1/stat 2>/dev/null)
-caller="$(cat /proc/$p2/comm 2>/dev/null)/$(cat /proc/$p1/comm 2>/dev/null)"
-{ echo "### $(date +%T) [$caller] rc=$rc: $cmd $*"; [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/    /'; } >> /root/luks-pools/calls.log
-EOF_LOG
-
-# -----------------------------------------------------------------------------
-cat > $D/install-shims.sh <<'EOF_INST'
-#!/bin/bash
-# (re)apply all shims - idempotent, run at every boot and after firmware updates
-for f in /usr/sbin/*; do
-  [ -L "$f" ] && [ "$(readlink "$f")" = lvm ] && ln -sfn /opt/lvmshim/lvm-shim "$f"
-done
-for c in pvs pvdisplay pvresize pvscan pvremove pvcreate vgs vgdisplay vgchange vgcfgbackup lvs lvdisplay lvcreate lvextend lvremove; do
-  [ -e /usr/sbin/$c ] || [ -L /usr/sbin/$c ] || continue
-  [ "$(readlink /usr/sbin/$c)" = /opt/lvmshim/lvm-shim ] || ln -sfn /opt/lvmshim/lvm-shim /usr/sbin/$c
-done
-wrap(){ local bin=$1 shim=$2
-  if [ -f "$bin" ] && [ ! -L "$bin" ]; then mv -f "$bin" "$bin.real"; fi
-  [ -x "$bin.real" ] || { logger -t lvmshim "missing $bin.real"; return 1; }
-  [ "$(readlink $bin)" = "$shim" ] || ln -sfn "$shim" "$bin"
-}
-wrap /usr/sbin/blkid /opt/lvmshim/blkid-shim
-wrap /usr/bin/lsblk  /opt/lvmshim/lsblk-shim
-exit 0
-EOF_INST
-
-cat > $D/remove-shims.sh <<'EOF_RM'
-#!/bin/bash
-# restore original tools (encrypted pools will NOT work with TOS afterwards)
-for f in /usr/sbin/*; do
-  [ -L "$f" ] && [ "$(readlink "$f")" = /opt/lvmshim/lvm-shim ] && ln -sfn lvm "$f"
-done
-for b in /usr/sbin/blkid /usr/bin/lsblk; do [ -x $b.real ] && mv -f $b.real $b; done
-exit 0
-EOF_RM
-
-# -----------------------------------------------------------------------------
-cat > $D/unlock.sh <<'EOF_UNLOCK'
-#!/bin/bash
-# Interactive unlock (run over SSH while the NAS waits at boot)
-. /opt/lvmshim/common.sh
-/opt/lvmshim/install-shims.sh
-[ -n "$(pool_uuids)" ] || { echo "no pools in $POOLS_CONF"; exit 1; }
-for u in $(pool_uuids); do md_members_present "$u" || echo "SKIP: $u - no disks of this pool in the NAS"; done
-rc=0
-for u in $(present_uuids); do
-  md=$(md_ensure "$u") || { echo "FAIL: cannot assemble array $u"; rc=1; continue; }
-  c=$(crypt_name "$md")
-  if [ ! -b /dev/mapper/$c ]; then
-    echo "Unlocking $md ($u) as $c"
-    cryptsetup open "$md" "$c" || { echo "FAIL: could not open $md"; rc=1; continue; }
-  fi
-  vg=$(/usr/sbin/lvm pvs --noheadings -o vg_name /dev/mapper/$c 2>/dev/null | tr -d ' ')
-  [ -n "$vg" ] && /usr/sbin/lvm vgchange -ay "$vg" >/dev/null
-  echo "OK:   $md -> $c -> ${vg:-<no VG>}"
-done
-vgcfgbackup >/dev/null 2>&1      # via shim: device hints -> /dev/mdN
-exit $rc
-EOF_UNLOCK
-
-# -----------------------------------------------------------------------------
-cat > $D/wait-unlock.sh <<'EOF_WAIT'
-#!/bin/bash
-# Boot: holds TOS storage start until every pool is unlocked.
-# Unlock routes: SSH (unlock.sh), browser page (https://<nas>:8443), USB key stick.
-# UNLOCK_TIMEOUT=0 (default) waits forever; >0 powers off after that many seconds.
-. /opt/lvmshim/common.sh
-UNLOCK_TIMEOUT=0; UNLOCK_WEB_PORT=8443
-[ -r /opt/lvmshim/settings.conf ] && . /opt/lvmshim/settings.conf
-/opt/lvmshim/install-shims.sh
-for u in $(pool_uuids); do md_members_present "$u" || logger -t luks-pools "pool $u: no member disks present - not waiting for it"; done
-[ -n "$(present_uuids)" ] || exit 0
-
-all_open(){ local u md
-  for u in $(present_uuids); do
-    md=$(md_active_dev "$u") || return 1
-    [ -b /dev/mapper/$(crypt_name "$md") ] || return 1
-  done; }
-
-for u in $(present_uuids); do md_ensure "$u" >/dev/null || logger -t luks-pools "cannot assemble $u"; done
-
-# optional unattended unlock: USB stick labelled NASKEY with <md-uuid, ':'->'-'>.key
-if [ -b /dev/disk/by-label/NASKEY ]; then
-  mkdir -p /run/naskey && mount -o ro /dev/disk/by-label/NASKEY /run/naskey && {
-    for u in $(present_uuids); do
-      md=$(md_active_dev "$u") || continue
-      k=/run/naskey/${u//:/-}.key
-      [ -f "$k" ] && cryptsetup open --key-file "$k" "$md" "$(crypt_name "$md")"
+is_encrypted_uuid() { pool_uuids | grep -qx "$1"; }
+md_uuid_of()  { mdadm --detail --export "$1" 2>/dev/null | sed -n 's/^MD_UUID=//p'; }
+md_level_of() { mdadm --detail --export "$1" 2>/dev/null | sed -n 's/^MD_LEVEL=//p'; }
+md_disks_of() {   # serial numbers of the member disks
+    local s p d out=()
+    for s in /sys/block/"${1#/dev/}"/slaves/*; do
+        [[ -e $s ]] || continue
+        p=$(basename "$s"); d=$(lsblk -no PKNAME "/dev/$p" 2>/dev/null | head -n1)
+        out+=("${d:-$p}:$(lsblk -dno SERIAL "/dev/${d:-$p}" 2>/dev/null | tr -d ' ')")
     done
-    umount /run/naskey; }
-fi
+    echo "${out[*]}"
+}
+data_arrays() {   # active md arrays except the TOS system arrays md8/md9
+    awk '/^md[0-9]+ :/ { print "/dev/"$1 }' ${MDSTAT:-/proc/mdstat} | grep -vxE '/dev/md(8|9)' | sort -V
+}
+vg_of_md()   { pvs --noheadings -o vg_name "$1" 2>/dev/null | tr -d ' '; }    # via shim: works for open crypt too
+pool_name()  { ini_get /etc/volume/storage.conf "$1" name; }
+syncing()    { local a; a=$(cat /sys/block/"${1#/dev/}"/md/sync_action 2>/dev/null); [[ -n $a && $a != idle ]]; }
 
-WEBPID=
-if ! all_open; then
-  if [ "${UNLOCK_WEB_PORT:-0}" != 0 ] && [ -s /opt/lvmshim/tls/cert.pem ] && command -v python3 >/dev/null; then
-    UNLOCK_PORT=$UNLOCK_WEB_PORT python3 /opt/lvmshim/unlock-web.py &
-    WEBPID=$!
-    logger -t luks-pools "browser unlock page on https://<nas>:$UNLOCK_WEB_PORT"
-  fi
-  logger -t luks-pools "waiting for unlock (timeout ${UNLOCK_TIMEOUT}s, 0 = forever): ssh + /opt/lvmshim/unlock.sh, or the browser page"
-fi
+keyslot_count() {
+    cryptsetup luksDump "$1" 2>/dev/null | awk '
+        /^Keyslots:/ { k=1; next } /^Tokens:/ { k=0 }
+        k && /^  [0-9]+: / { n++ } END { print n+0 }'
+}
 
-t=0
-while ! all_open; do
-  [ "$UNLOCK_TIMEOUT" -gt 0 ] && [ $t -ge "$UNLOCK_TIMEOUT" ] && break
-  # restart the page if it died
-  if [ -n "$WEBPID" ] && ! kill -0 $WEBPID 2>/dev/null; then
-    UNLOCK_PORT=$UNLOCK_WEB_PORT python3 /opt/lvmshim/unlock-web.py & WEBPID=$!
-  fi
-  sleep 1; t=$((t+1))
+refresh_header() {   # uuid md
+    local f tmp; f=$(header_file "$1"); tmp="$f.new"
+    mkdir -p "$STATE_DIR"; rm -f "$tmp"
+    if cryptsetup luksHeaderBackup "$2" --header-backup-file "$tmp" && mv -f "$tmp" "$f"; then
+        chmod 600 "$f"; ok "Header backup refreshed: $f"
+        warn "Copy it off the NAS and delete older copies (they keep old passphrases valid)."
+    else
+        rm -f "$tmp"; err "Header backup failed."
+    fi
+}
+
+describe_md() {   # md  -> one block of text about an array
+    local md=$1 u lvl vg tag name st c lv mp sz
+    u=$(md_uuid_of "$md"); lvl=$(md_level_of "$md")
+    sz=$(lsblk -dno SIZE "$md" 2>/dev/null | tr -d ' ')
+    if is_encrypted_uuid "$u"; then
+        c=$(crypt_name "$md")
+        [[ -b /dev/mapper/$c ]] && st="${GRN}encrypted, unlocked${RST} ($c)" || st="${YEL}encrypted, LOCKED${RST}"
+    else
+        st="not encrypted"
+    fi
+    vg=$(vg_of_md "$md")
+    tag=$( [[ -n $vg ]] && $LVM vgs --noheadings -o vg_tags "$vg" 2>/dev/null | tr -d ' ')
+    name=$( [[ -n $tag ]] && pool_name "$tag")
+    printf "\n${BLD}%s${RST}  %s  %s  %s\n" "$md" "${name:-?}" "$lvl" "$sz"
+    printf "    State     : %s\n" "$st"
+    printf "    md UUID   : %s\n" "$u"
+    printf "    Disks     : %s\n" "$(md_disks_of "$md")"
+    syncing "$md" && printf "    RAID      : ${YEL}%s in progress${RST}\n" "$(cat /sys/block/"${md#/dev/}"/md/sync_action)"
+    [[ -n $vg ]] && printf "    VG        : %s (tag %s)\n" "$vg" "${tag:--}"
+    if [[ -n $vg ]]; then
+        while read -r lv; do
+            [[ -n $lv ]] || continue
+            mp=$(findmnt -rn -o TARGET -S "/dev/mapper/$vg-$lv" 2>/dev/null | grep -m1 '^/Volume')
+            sz=$($LVM lvs --noheadings -o lv_size "$vg/$lv" 2>/dev/null | tr -d ' ')
+            printf "    Volume    : %s/%s %s %s\n" "$vg" "$lv" "$sz" "${mp:-(not mounted)}"
+        done < <($LVM lvs --noheadings -o lv_name "$vg" 2>/dev/null | tr -d ' ')
+    fi
+}
+
+# Choose an encrypted pool from pools.conf. Sets SEL_U, SEL_MD (may be empty), SEL_STATE.
+pick_encrypted() {
+    local us=() u i n md st
+    mapfile -t us < <(pool_uuids)
+    (( ${#us[@]} )) || { warn "No encrypted pools registered in $POOLS_CONF."; return 1; }
+    echo
+    for i in "${!us[@]}"; do
+        u=${us[$i]}
+        if md=$(md_active_dev "$u"); then
+            [[ -b /dev/mapper/$(crypt_name "$md") ]] && st=unlocked || st=locked
+        elif md_members_present "$u"; then md="-"; st="disks present, array not assembled"
+        else md="-"; st="disks not in NAS"
+        fi
+        printf "  %d) %-9s %-38s %s\n" $((i+1)) "$md" "$u" "$st"
+    done
+    read -rp "Select pool [1-${#us[@]}], Enter = cancel: " n
+    if ! [[ $n =~ ^[0-9]+$ ]] || (( n < 1 || n > ${#us[@]} )); then
+        [[ -n $n ]] && err "Invalid choice."
+        return 1
+    fi
+    SEL_U=${us[$((n-1))]}
+    SEL_MD=$(md_active_dev "$SEL_U")
+    if [[ -n $SEL_MD ]]; then
+        [[ -b /dev/mapper/$(crypt_name "$SEL_MD") ]] && SEL_STATE=unlocked || SEL_STATE=locked
+    elif md_members_present "$SEL_U"; then SEL_STATE=unassembled
+    else SEL_STATE=absent
+    fi
+}
+
+free_md_number() {   # first md number not in use and not configured; skips 8 and 9
+    local n
+    for n in 1 2 3 4 5 6 7 $(seq 10 126); do
+        [[ -e /dev/md$n ]] && continue
+        grep -qsE "^ARRAY /dev/md$n( |$)" /etc/mdadm/mdadm.conf /etc/mdadm.conf && continue
+        echo "$n"; return
+    done
+}
+
+# ------------------------------------------------------------------ actions ---
+
+list_pools() {
+    echo "${DIM}Kit $(cat "$KIT/VERSION" 2>/dev/null || echo '?') · boot unit $(systemctl is-enabled luks-pools.service 2>/dev/null) · SSH at boot $(systemctl is-enabled ssh.service 2>/dev/null)${RST}"
+    local md any=0 u
+    for md in $(data_arrays); do describe_md "$md"; any=1; done
+    (( any )) || warn "No data arrays active."
+    for u in $(pool_uuids); do
+        md_active_dev "$u" >/dev/null && continue
+        if md_members_present "$u"; then warn "\nEncrypted pool $u: disks present but array not assembled."
+        else echo; echo "${DIM}Encrypted pool $u: disks not in the NAS (skipped at boot).${RST}"; fi
+    done
+}
+
+run_check()  { "$KIT/check.sh"; }
+run_unlock() { "$KIT/unlock.sh"; }
+
+encrypt_pool() {
+    local cands=() md u vg n i
+    for md in $(data_arrays); do
+        u=$(md_uuid_of "$md"); is_encrypted_uuid "$u" && continue
+        vg=$(vg_of_md "$md"); [[ -n $vg ]] || continue
+        [[ $($LVM vgs --noheadings -o lv_count "$vg" 2>/dev/null | tr -d ' ') == 0 ]] || continue
+        cands+=("$md")
+    done
+    if (( ! ${#cands[@]} )); then
+        warn "No candidate: an unencrypted TOS pool with NO volumes is needed."
+        echo "Create the pool in the TOS UI without a volume, wait for the RAID sync, then come back."
+        return
+    fi
+    echo; echo "Empty, unencrypted pools:"
+    for i in "${!cands[@]}"; do printf "\n  ${BLD}%d)${RST}" $((i+1)); describe_md "${cands[$i]}"; done
+    read -rp "Encrypt which [1-${#cands[@]}], Enter = cancel: " n
+    if ! [[ $n =~ ^[0-9]+$ ]] || (( n < 1 || n > ${#cands[@]} )); then return; fi
+    md=${cands[$((n-1))]}
+    syncing "$md" && { err "$md is still syncing - wait until it is idle."; return; }
+    warn "ALL DATA ON $md WILL BE DESTROYED (the pool must be empty anyway)."
+    "$KIT/convert-pool.sh" "$md" && {
+        echo; ok "Next: run the health check, create the volume in the TOS UI, reboot and unlock."
+        warn "Copy the new header backup off the NAS: $(header_file "$(md_uuid_of "$md")")"
+    }
+}
+
+register_pool() {
+    echo "Register an existing encrypted pool, e.g. after a clean TOS install."
+    warn "Recommended: do this with the pool's disks OUT of the NAS, then power off, insert them, power on and unlock."
+    local u md n hb
+    read -rp "md UUID of the encrypted array (xxxxxxxx:xxxxxxxx:xxxxxxxx:xxxxxxxx): " u
+    u=${u,,}
+    [[ $u =~ ^[0-9a-f]{8}(:[0-9a-f]{8}){3}$ ]] || { err "Invalid UUID format."; return; }
+    is_encrypted_uuid "$u" && { warn "$u is already registered."; return; }
+
+    if md=$(md_active_dev "$u"); then
+        warn "The array is already assembled as $md - TOS has probably seen it locked."
+        cryptsetup isLuks "$md" 2>/dev/null || { err "$md has no LUKS header - not an encrypted pool."; return; }
+        confirm "Register it anyway" || return
+        n=${md#/dev/md}
+    else
+        md=$(md_conf_name "$u")
+        if [[ -n $md ]]; then n=${md#/dev/md}; echo "mdadm config already lists it as $md."
+        else
+            n=$(free_md_number)
+            read -rp "md number to assemble it as [$n]: " md; n=${md:-$n}
+            [[ $n =~ ^[0-9]+$ ]] && (( n != 8 && n != 9 )) || { err "Invalid md number."; return; }
+            [[ -e /dev/md$n ]] && { err "/dev/md$n is in use."; return; }
+        fi
+    fi
+    read -rp "Path to this pool's header backup to restore (Enter = none): " hb
+    [[ -z $hb || -f $hb ]] || { err "$hb not found."; return; }
+
+    echo; echo "${BLD}About to register:${RST}"
+    echo "  md UUID : $u  (as /dev/md$n, mapping crypt$n)"
+    echo "  Header  : ${hb:-none - create one after the first unlock}"
+    confirm "Proceed" || return
+    echo "$u" >> "$POOLS_CONF"
+    [[ -n $(md_conf_name "$u") ]] || echo "ARRAY /dev/md$n metadata=1.2 UUID=$u" >> /etc/mdadm/mdadm.conf
+    [[ -n $hb ]] && { mkdir -p "$STATE_DIR"; cp -f "$hb" "$(header_file "$u")" && chmod 600 "$(header_file "$u")"; }
+    systemctl enable luks-pools.service >/dev/null 2>&1
+    ok "Registered. The next boot waits for it (if its disks are in the NAS)."
+}
+
+remove_pool() {
+    echo "Decommission an encrypted pool (move its data elsewhere first)."
+    pick_encrypted || return
+    local u=$SEL_U md=$SEL_MD c vg lvs n erase=0 f
+    if [[ $SEL_STATE == absent ]]; then
+        warn "Its disks are not in the NAS: only the registration is removed."
+        confirm "Unregister $u" || return
+        sed -i "/^$u\$/d" "$POOLS_CONF"; sed -i "/UUID=$u/d" /etc/mdadm/mdadm.conf
+        ok "Unregistered. Delete the pool in the TOS UI (it shows as missing its disks)."
+        f=$(header_file "$u"); [[ -f $f ]] && confirm "Also delete its header backup $f" && rm -f "$f"
+        return
+    fi
+    [[ $SEL_STATE == unassembled ]] && { err "Array not assembled - reboot (and unlock) first."; return; }
+    c=$(crypt_name "$md")
+    if [[ $SEL_STATE == unlocked ]]; then
+        vg=$($LVM pvs --noheadings -o vg_name "/dev/mapper/$c" 2>/dev/null | tr -d ' ')
+        lvs=$([[ -n $vg ]] && $LVM lvs --noheadings -o lv_name "$vg" 2>/dev/null | tr -d ' ' | paste -sd' ')
+        if [[ -n $lvs ]]; then
+            err "$vg still has volume(s): $lvs"
+            echo "Delete the shared folders and the volume(s) of this pool in the TOS UI first (keep the pool)."
+            return
+        fi
+    fi
+    describe_md "$md"
+    local disks; disks=$(md_disks_of "$md" | tr ' ' '\n' | cut -d: -f1 | grep . | paste -sd'|')
+    [[ -n $disks ]] && grep -E "^md(8|9) :" ${MDSTAT:-/proc/mdstat} | grep -qE "($disks)[0-9]" \
+        && { err "A disk of $md also holds a TOS system array (md8/md9) - stop, do this manually."; return; }
+    echo
+    confirm "Crypto-erase it (destroy all key slots: the old data can never be read again)" && erase=1
+    read -rp "Type the array name '${md#/dev/}' to decommission it: " n
+    [[ $n == "${md#/dev/}" ]] || { warn "Cancelled."; return; }
+
+    systemctl stop StorageManager
+    [[ -n $vg ]] && $LVM vgchange -an "$vg" >/dev/null
+    [[ -b /dev/mapper/$c ]] && { cryptsetup close "$c" || { err "Cannot close $c (in use?). StorageManager is stopped: systemctl start StorageManager"; return; }; }
+    if (( erase )); then
+        cryptsetup luksErase "$md" || { err "luksErase failed or cancelled; continuing without it."; erase=0; }
+    fi
+    mdadm --stop "$md" || warn "mdadm --stop $md failed."
+    sed -i "/^$u\$/d" "$POOLS_CONF"; sed -i "/UUID=$u/d" /etc/mdadm/mdadm.conf
+    f=$(header_file "$u")
+    if [[ -f $f ]]; then
+        if (( erase )); then rm -f "$f"; warn "Header backup deleted - delete all copies off the NAS too (they would make the erased disks readable)."
+        else confirm "Delete its header backup $f" && rm -f "$f"; fi
+    fi
+    ok "$md decommissioned and unregistered."
+    echo "${BLD}Next:${RST} power off, pull its disks, power on, then delete the pool in the TOS UI (it shows as missing its disks)."
+    warn "StorageManager is stopped until then; do not start it with these disks still inside."
+    confirm "Power off now" && systemctl poweroff
+}
+
+manage_keys() {
+    pick_encrypted || return
+    local md=$SEL_MD u=$SEL_U a slot mnt mounted=0 key
+    [[ -n $md ]] || { err "Array not assembled (disks missing?)."; return; }
+    echo
+    echo "  1) Change a passphrase"
+    echo "  2) Add a passphrase"
+    echo "  3) Add a USB key file (stick labelled NASKEY, unattended unlock)"
+    echo "  4) Remove a key slot"
+    echo "  5) Show key slots"
+    read -rp "Choice, Enter = cancel: " a
+    case $a in
+        1) cryptsetup luksChangeKey "$md" && { ok "Passphrase changed."; refresh_header "$u" "$md"; } ;;
+        2) cryptsetup luksAddKey "$md" && { ok "Passphrase added."; refresh_header "$u" "$md"; } ;;
+        3) mnt=$(findmnt -rn -o TARGET -S LABEL=NASKEY 2>/dev/null | head -n1)
+           if [[ -z $mnt ]]; then
+               [[ -b /dev/disk/by-label/NASKEY ]] || { err "No USB stick labelled NASKEY found."; return; }
+               mnt=/run/naskey-setup; mkdir -p "$mnt"; mount /dev/disk/by-label/NASKEY "$mnt" || return; mounted=1
+           fi
+           key="$mnt/${u//:/-}.key"
+           [[ -e $key ]] && { confirm "$key exists - replace it" || { (( mounted )) && umount "$mnt"; return; }; }
+           dd if=/dev/urandom of="$key" bs=64 count=1 status=none && chmod 600 "$key" 2>/dev/null
+           echo "Enter an EXISTING passphrase to authorise the new key:"
+           if cryptsetup luksAddKey "$md" "$key"; then ok "Key file added: $key"; refresh_header "$u" "$md"
+               warn "Anyone holding this stick can unlock the pool. Keep it away from the NAS when not needed."
+           else rm -f "$key"; err "luksAddKey failed - key file removed."; fi
+           sync; (( mounted )) && umount "$mnt" ;;
+        4) cryptsetup luksDump "$md" | sed -n '/^Keyslots:/,/^Tokens:/p' | grep -E '^  [0-9]+: '
+           (( $(keyslot_count "$md") > 1 )) || { err "Only one key slot - removing it would lock you out."; return; }
+           read -rp "Slot number to remove: " slot
+           [[ $slot =~ ^[0-9]+$ ]] || { err "Invalid slot."; return; }
+           confirm "Remove key slot $slot from $md" || return
+           echo "Enter a passphrase of ANOTHER slot:"
+           cryptsetup luksKillSlot "$md" "$slot" && { ok "Slot $slot removed."; refresh_header "$u" "$md"; } ;;
+        5) cryptsetup luksDump "$md" | sed -n '/^Keyslots:/,/^Tokens:/p' | grep -vE '^Tokens:' ;;
+        *) return ;;
+    esac
+}
+
+header_backups() {
+    local u md f any=0
+    for u in $(pool_uuids); do
+        md=$(md_active_dev "$u") || { echo "${DIM}$u: array not assembled - skipped${RST}"; continue; }
+        f=$(header_file "$u"); any=1
+        if [[ ! -f $f ]]; then
+            warn "$md ($u): no header backup."
+            confirm "Create it now" && refresh_header "$u" "$md"
+        elif cmp -s <(head -c "$(stat -c %s "$f")" "$md") "$f"; then
+            ok "$md ($u): backup matches - $f"
+        else
+            warn "$md ($u): backup differs from the header on disk (key change?)."
+            confirm "Refresh it" && refresh_header "$u" "$md"
+        fi
+    done
+    (( any )) && echo "Keep current copies off the NAS: $STATE_DIR/*-header.img"
+}
+
+settings() {
+    local f=$KIT/settings.conf t p
+    [[ -f $f ]] || cp "$KIT/settings.conf.default" "$f"
+    # shellcheck source=/dev/null
+    t=$(. "$f"; echo "$UNLOCK_TIMEOUT"); p=$(. "$f"; echo "$UNLOCK_WEB_PORT")
+    echo "  Unlock timeout : ${t}s (0 = wait forever; >0 = power off when nobody unlocks)"
+    echo "  Unlock page    : port $p (0 = disabled)"
+    read -rp "New timeout in seconds [$t]: " t2; t2=${t2:-$t}
+    read -rp "New unlock page port [$p]: " p2; p2=${p2:-$p}
+    [[ $t2 =~ ^[0-9]+$ ]] || { err "Invalid timeout."; return; }
+    [[ $p2 =~ ^[0-9]+$ ]] && (( p2 <= 65535 )) || { err "Invalid port."; return; }
+    sed -i -E "s/^UNLOCK_TIMEOUT=.*/UNLOCK_TIMEOUT=$t2/; s/^UNLOCK_WEB_PORT=.*/UNLOCK_WEB_PORT=$p2/" "$f"
+    ok "Saved to $f (used from the next boot)."
+}
+
+# --------------------------------------------------------------------- menu ---
+
+while true; do
+    echo
+    echo "${BLD}===== Encrypted pools (luks-kit) =====${RST}"
+    echo "  1) List pools"
+    echo "  2) Health check"
+    echo "  3) Unlock locked pools"
+    echo "  4) Encrypt an empty pool"
+    echo "  5) Register an existing encrypted pool (after a clean install)"
+    echo "  6) Decommission an encrypted pool"
+    echo "  7) Passphrases and key files"
+    echo "  8) Header backups"
+    echo "  9) Boot unlock settings"
+    echo "  0) Exit"
+    read -rp "Choice: " choice
+    case $choice in
+        1) list_pools ;;
+        2) run_check ;;
+        3) run_unlock ;;
+        4) encrypt_pool ;;
+        5) register_pool ;;
+        6) remove_pool ;;
+        7) manage_keys ;;
+        8) header_backups ;;
+        9) settings ;;
+        0|q|Q) exit 0 ;;
+        *) err "Unknown option." ;;
+    esac
 done
-[ -n "$WEBPID" ] && { sleep 3; kill $WEBPID 2>/dev/null; }   # 3 s: let the page answer "done"
-
-if all_open; then
-  for u in $(present_uuids); do
-    md=$(md_active_dev "$u"); c=$(crypt_name "$md")
-    vg=$(/usr/sbin/lvm pvs --noheadings -o vg_name /dev/mapper/$c 2>/dev/null | tr -d ' ')
-    [ -n "$vg" ] && /usr/sbin/lvm vgchange -ay "$vg"
-  done
-  vgcfgbackup >/dev/null 2>&1
-  logger -t luks-pools "all pools unlocked, continuing boot"
-  exit 0
-fi
-logger -t luks-pools "not all pools unlocked in ${UNLOCK_TIMEOUT}s - powering off to protect them"
-for u in $(present_uuids); do
-  md=$(md_active_dev "$u") || continue
-  [ -b /dev/mapper/$(crypt_name "$md") ] || mdadm --stop "$md"
-done
-systemctl --no-block poweroff
-exit 1
-EOF_WAIT
-
-# -----------------------------------------------------------------------------
-cat > $D/poolstate.sh <<'EOF_STATE'
-#!/bin/bash
-# one line per pool: <md-uuid> <md device|-> <crypt name|-> <open|locked|missing>
-. /opt/lvmshim/common.sh
-for u in $(pool_uuids); do
-  if md=$(md_active_dev "$u"); then
-    c=$(crypt_name "$md"); [ -b /dev/mapper/$c ] && st=open || st=locked
-  elif md_members_present "$u"; then md=-; c=-; st=missing
-  else md=-; c=-; st=absent; fi
-  echo "$u $md $c $st"
-done
-EOF_STATE
-
-cat > $D/open-pool.sh <<'EOF_OPEN'
-#!/bin/bash
-# open one pool by md UUID; passphrase is read from stdin (exactly, no newline added)
-. /opt/lvmshim/common.sh
-u=$1
-pool_uuids | grep -qx "$u" || { echo "unknown pool"; exit 3; }
-md=$(md_ensure "$u" 2>/dev/null) || { echo "cannot assemble the RAID array"; exit 2; }
-c=$(crypt_name "$md")
-[ -b /dev/mapper/$c ] && { echo "already unlocked"; exit 0; }
-cryptsetup open --key-file=- "$md" "$c" >/dev/null 2>&1 || { echo "wrong passphrase"; exit 1; }
-vg=$(/usr/sbin/lvm pvs --noheadings -o vg_name /dev/mapper/$c 2>/dev/null | tr -d ' ')
-[ -n "$vg" ] && /usr/sbin/lvm vgchange -ay "$vg" >/dev/null 2>&1
-logger -t luks-pools "unlocked $md as $c"
-echo "unlocked"
-EOF_OPEN
-
-cat > $D/unlock-web.py <<'EOF_WEB'
-#!/usr/bin/env python3
-"""Minimal HTTPS unlock page, run by wait-unlock.sh only while pools are locked.
-Standard library only. Passphrases go to cryptsetup on stdin and are never logged."""
-import html, http.server, os, secrets, ssl, subprocess, threading, time, urllib.parse
-
-BASE = os.environ.get('LVMSHIM_DIR', '/opt/lvmshim')
-PORT = int(os.environ.get('UNLOCK_PORT', '8443'))
-CERT, KEY = BASE + '/tls/cert.pem', BASE + '/tls/key.pem'
-HOST = os.uname().nodename
-LOCK = threading.Lock()
-RESULTS = {}
-
-def pools():
-    out = subprocess.run([BASE + '/poolstate.sh'], capture_output=True, text=True).stdout
-    return [l.split() for l in out.splitlines() if len(l.split()) == 4]
-
-def render(msgs, done):
-    rows = ''.join(
-        '<tr><td>{}</td><td class="{}">{}</td></tr>'.format(
-            html.escape(md if md != '-' else 'array ' + u[:8]), st,
-            {'open': 'unlocked', 'locked': 'locked', 'missing': 'array not assembled', 'absent': 'disks not in NAS, skipped'}[st])
-        for u, md, c, st in pools())
-    note = ''.join('<p class="msg">{}</p>'.format(html.escape(m)) for m in msgs)
-    if done:
-        body = ('<p class="ok">All pools are unlocked. TOS is starting now; its web interface '
-                'will be available in about a minute.</p>')
-    else:
-        body = ('<form method="post" action="/" autocomplete="off">'
-                '<label for="pw">Passphrase</label>'
-                '<input id="pw" name="pw" type="password" autocomplete="off" autofocus required>'
-                '<button type="submit">Unlock</button></form>'
-                '<p class="hint">The passphrase is tried on every locked pool. '
-                'Pools with a different passphrase stay locked; submit again for those.</p>')
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(HOST)} unlock</title>
-<style>
-:root{{--bg:#f6f6f4;--fg:#1d1d1b;--muted:#6b6b66;--card:#fff;--line:#deded9;--acc:#2f5d8a;--ok:#2e7d4f;--bad:#b3261e}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#151514;--fg:#ececea;--muted:#9a9a95;--card:#1f1f1d;--line:#33332f;--acc:#7aa7d6;--ok:#6cc08b;--bad:#f08a80}}}}
-body{{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif}}
-main{{max-width:420px;margin:12vh auto;padding:0 16px}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:24px}}
-h1{{font-size:20px;margin:0 0 4px}} .sub{{color:var(--muted);margin:0 0 18px;font-size:14px}}
-table{{width:100%;border-collapse:collapse;margin-bottom:18px;font-size:14px}}
-td{{padding:6px 0;border-bottom:1px solid var(--line)}} td:last-child{{text-align:right}}
-.open{{color:var(--ok)}} .locked,.missing{{color:var(--bad)}} .absent{{color:var(--muted)}}
-label{{display:block;font-size:14px;margin-bottom:6px}}
-input{{box-sizing:border-box;width:100%;padding:10px;font-size:16px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}}
-button{{margin-top:12px;width:100%;padding:10px;font-size:16px;border:0;border-radius:6px;background:var(--acc);color:#fff;cursor:pointer}}
-.hint{{color:var(--muted);font-size:13px;margin:14px 0 0}} .msg{{font-size:14px;margin:0 0 12px}} .ok{{color:var(--ok)}}
-</style></head><body><main><div class="card">
-<h1>Unlock encrypted storage</h1><p class="sub">{html.escape(HOST)} is waiting before it starts its storage services.</p>
-<table>{rows}</table>{note}{body}</div></main></body></html>'''
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = 'unlock'
-    sys_version = ''
-    timeout = 30
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def page(self, msgs=(), done=False):
-        data = render(msgs, done).encode()
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.send_header('Content-Length', str(len(data)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('Referrer-Policy', 'no-referrer')
-        self.send_header('Content-Security-Policy',
-                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_GET(self):
-        url = urllib.parse.urlsplit(self.path)
-        if url.path not in ('/', '/index.html'):
-            self.send_error(404); return
-        token = urllib.parse.parse_qs(url.query).get('r', [''])[0]
-        with LOCK:
-            msgs = RESULTS.pop(token, ())      # shown once; a reload shows the plain page
-        self.page(msgs, done=all(p[3] in ('open', 'absent') for p in pools()))
-
-    def do_POST(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        if n <= 0 or n > 4096:
-            self.send_error(400); return
-        form = urllib.parse.parse_qs(self.rfile.read(n).decode('utf-8', 'replace'), keep_blank_values=True)
-        pw = form.get('pw', [''])[0]
-        msgs = []
-        if not pw:
-            msgs.append('Enter a passphrase.')
-        else:
-            with LOCK:                      # one attempt at a time
-                opened = 0
-                for u, md, c, st in pools():
-                    if st in ('open', 'absent'):
-                        continue
-                    r = subprocess.run([BASE + '/open-pool.sh', u], input=pw.encode('utf-8'),
-                                       capture_output=True)
-                    name = md if md != '-' else 'array ' + u[:8]
-                    msgs.append('{}: {}'.format(name, r.stdout.decode(errors='replace').strip() or 'failed'))
-                    opened += (r.returncode == 0)
-                if not opened:
-                    time.sleep(3)           # slow down guessing
-        pw = None
-        # Post/Redirect/Get: the browser keeps only a GET in its history, so a reload or a
-        # reconnecting tab can never send the passphrase again
-        token = secrets.token_urlsafe(16)
-        with LOCK:
-            RESULTS[token] = msgs
-            while len(RESULTS) > 20:
-                RESULTS.pop(next(iter(RESULTS)))
-        self.send_response(303)
-        self.send_header('Location', '/?r=' + token)
-        self.send_header('Content-Length', '0')
-        self.send_header('Cache-Control', 'no-store')
-        self.end_headers()
-
-class Server(http.server.ThreadingHTTPServer):
-    daemon_threads = True
-
-    def handle_error(self, request, client_address):
-        pass                                # plain-HTTP probes, dropped connections
-
-def main():
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(CERT, KEY)
-    srv = Server(('', PORT), Handler)
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
-    srv.serve_forever()
-
-if __name__ == '__main__':
-    main()
-EOF_WEB
-
-cat > $D/settings.conf.default <<'EOF_SET'
-# /opt/lvmshim/settings.conf
-# Seconds to wait for the unlock at boot before powering off; 0 = wait forever.
-UNLOCK_TIMEOUT=0
-# Port of the browser unlock page (https); 0 disables the page.
-UNLOCK_WEB_PORT=8443
-EOF_SET
-
-# -----------------------------------------------------------------------------
-cat > $D/check.sh <<'EOF_CHECK'
-#!/bin/bash
-# Read-only health check. Exit code 0 = all PASS.
-. /opt/lvmshim/common.sh
-fail=0
-ok(){ echo "  PASS  $*"; }
-bad(){ echo "  FAIL  $*"; fail=1; }
-
-echo "== components (kit version $(cat /opt/lvmshim/VERSION 2>/dev/null || echo unknown))"
-for c in pvs vgs lvs pvresize vgcfgbackup lvcreate lvextend; do
-  [ "$(readlink /usr/sbin/$c)" = /opt/lvmshim/lvm-shim ] && ok "$c shimmed" || bad "$c not shimmed (run install-shims.sh)"
-done
-[ "$(readlink /usr/sbin/blkid)" = /opt/lvmshim/blkid-shim ] && [ -x /usr/sbin/blkid.real ] && ok "blkid shimmed" || bad "blkid not shimmed"
-[ "$(readlink /usr/bin/lsblk)" = /opt/lvmshim/lsblk-shim ] && [ -x /usr/bin/lsblk.real ] && ok "lsblk shimmed" || bad "lsblk not shimmed"
-[ -e /opt/lvmshim/DEBUG ] && bad "debug logging is on (rm /opt/lvmshim/DEBUG)" || ok "debug logging off"
-systemctl is-enabled luks-pools.service >/dev/null 2>&1 && ok "luks-pools.service enabled" || bad "luks-pools.service not enabled"
-systemctl is-enabled ssh.service >/dev/null 2>&1 && ok "SSH enabled at boot" \
-  || bad "SSH not enabled at boot - enable it in the TOS UI, otherwise pools cannot be unlocked (NAS powers off)"
-[ -e /etc/systemd/system/luks-md1.service ] && bad "old luks-md1.service still present" || ok "no old unit"
-[ -s /opt/lvmshim/tls/cert.pem ] && command -v python3 >/dev/null && ok "browser unlock page ready (port $(. /opt/lvmshim/settings.conf; echo $UNLOCK_WEB_PORT))" || bad "browser unlock page not available (certificate or python3 missing)"
-( . /opt/lvmshim/settings.conf; [ "${UNLOCK_TIMEOUT:-0}" = 0 ] ) && ok "boot waits for unlock without time limit" || ok "boot powers off after $(. /opt/lvmshim/settings.conf; echo $UNLOCK_TIMEOUT)s without unlock"
-[ -n "$(pool_uuids)" ] && ok "pools.conf: $(pool_uuids | wc -l) pool(s)" || bad "pools.conf has no pools"
-
-for u in $(pool_uuids); do
-  echo "== pool $u"
-  md_members_present "$u" || { ok "disks of this pool are not in the NAS - skipped (re-insert, then reboot and unlock)"; continue; }
-  md=$(md_active_dev "$u") || { bad "array not active"; continue; }
-  c=$(crypt_name "$md"); n=${md#/dev/md}
-  ok "array is $md"
-  grep -q '\[U*\]' <(grep -A1 "^md$n " /proc/mdstat) && ! grep -A1 "^md$n " /proc/mdstat | grep -q '_' \
-     && ok "RAID healthy" || bad "RAID degraded or rebuilding: $(grep -A1 "^md$n " /proc/mdstat | tail -1)"
-  cryptsetup luksDump "$md" >/dev/null 2>&1 && ok "LUKS header readable" || bad "no readable LUKS header on $md"
-  [ -b /dev/mapper/$c ] || { bad "$c not open (run unlock.sh)"; continue; }
-  ok "$c open"
-  t=$(blkid -o value -s TYPE "$md");                 [ "$t" = LVM2_member ] && ok "blkid sees LVM2_member" || bad "blkid sees '$t'"
-  t=$(lsblk --noheadings -o FSTYPE "$md" | head -1); [ "$t" = LVM2_member ] && ok "lsblk sees LVM2_member" || bad "lsblk sees '$t'"
-  vg=$(pvs --noheadings -o vg_name "$md" 2>/dev/null | tr -d ' ')
-  [ -n "$vg" ] && ok "pvs $md -> $vg" || { bad "pvs $md shows no VG"; continue; }
-  ps=$(pvs --noheadings --units s --nosuffix -o pe_start "$md" 2>/dev/null | tr -d ' ')
-  [ -n "$ps" ] && [ $((ps % 8)) = 0 ] && ok "PV data start $ps sectors (4K aligned)" || bad "PV data start '$ps' not 4K aligned - volumes cannot be created"
-  h=$(sed -n 's/.*device = "\([^"]*\)".*/\1/p' /etc/lvm/backup/$vg 2>/dev/null | head -1)
-  [ "$h" = "$md" ] && ok "LVM backup hint $h" || bad "LVM backup hint is '$h' (run: vgcfgbackup)"
-  tag=$(pvs --noheadings -o vg_tags "$md" 2>/dev/null | tr -d ' ')
-  [ -n "$tag" ] && grep -q "^\[$tag\]" /etc/volume/storage.conf && ok "registered as TOS pool $tag" || bad "VG tag '$tag' not in storage.conf"
-  grep -q "^\[$u\]" /etc/volume/storage.conf /etc/volume/volume.conf 2>/dev/null \
-     && bad "bogus legacy entry [$u] in /etc/volume/*.conf" || ok "no legacy-volume entry"
-  hb=$(header_file "$u")
-  if [ -f "$hb" ]; then
-    cmp -s <(head -c "$(stat -c %s "$hb")" "$md") "$hb" && ok "header matches $hb" || bad "header differs from $hb"
-  else bad "no header backup $hb"; fi
-  for lv in $(lvs --noheadings -o lv_name "$vg" 2>/dev/null); do
-    mp=$(findmnt -rn -o TARGET -S "/dev/mapper/$vg-$lv" 2>/dev/null | grep -m1 '^/Volume')
-    [ -n "$mp" ] && ok "volume $vg/$lv mounted on $mp" || bad "volume $vg/$lv not mounted"
-  done
-done
-echo "== misc"
-[ -s /run/lvmshim/unhandled.log ] && bad "unhandled lsblk calls in /run/lvmshim/unhandled.log" || ok "no unhandled lsblk calls"
-echo
-[ $fail = 0 ] && echo "RESULT: ALL CHECKS PASSED" || echo "RESULT: SOME CHECKS FAILED - do not continue"
-exit $fail
-EOF_CHECK
-
-# -----------------------------------------------------------------------------
-cat > $D/convert-pool.sh <<'EOF_CONV'
-#!/bin/bash
-# Convert an EMPTY TOS pool (md -> PV -> VG, no volumes) into md -> LUKS -> PV -> VG.
-# Usage: convert-pool.sh /dev/mdN        ALL DATA ON THE ARRAY IS DESTROYED.
-. /opt/lvmshim/common.sh
-md=${1:-}
-die(){ echo; echo "STOP: $*"; exit 1; }
-[[ $md =~ ^/dev/md[0-9]+$ ]] || { echo "usage: $0 /dev/mdN"; exit 2; }
-n=${md#/dev/md}; c=crypt$n
-LVM=/usr/sbin/lvm
-
-echo "== pre-checks"
-[ -b "$md" ] || die "$md does not exist"
-case $n in 8|9) die "$md is a TOS system/swap array";; esac
-u=$(mdadm --detail --export "$md" | sed -n 's/^MD_UUID=//p'); [ -n "$u" ] || die "no MD_UUID for $md"
-pool_uuids | grep -qx "$u" && die "$u is already in $POOLS_CONF"
-[ "$(cat /sys/block/md$n/md/degraded)" = 0 ] || die "array is degraded"
-[ "$(cat /sys/block/md$n/md/sync_action)" = idle ] || die "array is syncing/rebuilding - wait until it is idle"
-[ -e /dev/mapper/$c ] && die "/dev/mapper/$c already exists"
-[ "$(md_conf_name "$u")" = "$md" ] || die "mdadm config does not list $u as $md"
-sz=$(blockdev --getsz "$md"); [ $((sz % 8)) = 0 ] || die "array size is not 4K aligned"
-/opt/lvmshim/install-shims.sh
-vg=$($LVM pvs --noheadings -o vg_name "$md" 2>/dev/null | tr -d ' ')
-[ -n "$vg" ] || die "$md is not an LVM PV with a VG - create the pool in the TOS UI first"
-[ "$($LVM vgs --noheadings -o pv_count "$vg" | tr -d ' ')" = 1 ] || die "$vg has more than one PV"
-[ "$($LVM vgs --noheadings -o lv_count "$vg" | tr -d ' ')" = 0 ] || die "$vg still has volumes - delete them in the UI first"
-tag=$($LVM vgs --noheadings -o vg_tags "$vg" | tr -d ' ')
-vgid=$($LVM vgs --noheadings -o vg_uuid "$vg" | tr -d ' ')
-pvid=$($LVM pvs --noheadings -o pv_uuid "$md" | tr -d ' ')
-pe_start=$($LVM pvs --noheadings --units s --nosuffix -o pe_start "$md" | tr -d ' ')
-# LUKS uses 4 KiB sectors: the data start must be 4K aligned. TOS may pick odd offsets
-# (e.g. 65535 from a bogus optimal-io hint), so round up to a 1 MiB boundary.
-pe_start=$(( (pe_start + 2047) / 2048 * 2048 ))
-ext=$($LVM vgs --noheadings --units s --nosuffix -o vg_extent_size "$vg" | tr -d ' ')
-[ -n "$tag" ] && grep -q "^\[$tag\]" /etc/volume/storage.conf || die "VG tag '$tag' is not a TOS pool in storage.conf"
-grep -qs "$u" /etc/volume/storage/$tag.json || die "/etc/volume/storage/$tag.json does not reference $u"
-mkdir -p "$STATE_DIR"; B="$STATE_DIR/${u//:/-}"
-$LVM vgcfgbackup -f "$B.vg.orig" "$vg" >/dev/null || die "vgcfgbackup failed"
-cp /etc/volume/storage/$tag.json "$B.pool.json"
-
-cat <<INFO
-
-  array      $md   (md UUID $u)
-  VG         $vg   (uuid $vgid, TOS tag $tag)
-  PV uuid    $pvid
-  pe_start   $pe_start sectors, extent $ext sectors
-  mapping    /dev/mapper/$c
-
-  ALL DATA ON $md WILL BE DESTROYED.
-INFO
-read -r -p "Type YES to encrypt $md: " a; [ "$a" = YES ] || die "aborted, nothing changed"
-
-echo "== encrypting"
-systemctl stop StorageManager
-$LVM vgchange -an "$vg" >/dev/null || die "vgchange -an failed (StorageManager is stopped; start it again)"
-wipefs -a "$md" >/dev/null
-cryptsetup luksFormat --type luks2 --sector-size 4096 "$md" || die "luksFormat failed - array now has no PV; re-run convert or delete the pool in the UI"
-cryptsetup open "$md" "$c" || die "cryptsetup open failed"
-cryptsetup luksHeaderBackup "$md" --header-backup-file "$(header_file "$u")" || die "header backup failed"
-
-echo "== restoring $vg on /dev/mapper/$c"
-SZ=$(blockdev --getsz /dev/mapper/$c); PE=$(( (SZ - pe_start) / ext ))
-[ "$PE" -gt 0 ] || die "computed pe_count $PE"
-sed -E "s/(pe_start = )[0-9]+/\1$pe_start/; s/(dev_size = )[0-9]+/\1$SZ/; s/(pe_count = )[0-9]+/\1$PE/" "$B.vg.orig" > "$B.vg.luks"
-$LVM pvcreate -y --uuid "$pvid" --restorefile "$B.vg.luks" /dev/mapper/$c >/dev/null || die "pvcreate failed"
-$LVM vgcfgrestore -f "$B.vg.luks" "$vg" >/dev/null || die "vgcfgrestore failed"
-$LVM vgchange -ay "$vg" >/dev/null
-echo "$u" >> "$POOLS_CONF"
-vgcfgbackup >/dev/null 2>&1        # via shim: hint -> $md
-
-echo "== post-checks"
-[ "$($LVM vgs --noheadings -o vg_uuid "$vg" | tr -d ' ')" = "$vgid" ] || die "VG uuid changed"
-[ "$(pvs --noheadings -o vg_name "$md" | tr -d ' ')" = "$vg" ] || die "pvs $md does not show $vg"
-[ "$($LVM pvs --noheadings --units s --nosuffix -o pe_start /dev/mapper/$c | tr -d ' ')" = "$pe_start" ] || die "PV data start is not $pe_start"
-# prove the kernel accepts LVs on it: create and remove a 4 MiB test LV
-$LVM lvcreate -y -l 1 -n luks_probe "$vg" >/dev/null 2>&1 && $LVM lvremove -y "$vg/luks_probe" >/dev/null 2>&1 \
-  || die "test volume could not be created on $vg - do not create volumes in the UI"
-vgcfgbackup >/dev/null 2>&1
-[ "$(blkid -o value -s TYPE "$md")" = LVM2_member ] || die "blkid shim not effective"
-grep -q "device = \"$md\"" /etc/lvm/backup/$vg || die "LVM backup hint not $md"
-systemctl start StorageManager
-echo
-echo "DONE: $md is now LUKS-encrypted (pe_count $PE). Header backup: $(header_file "$u")"
-echo "Copy the header backup OFF the NAS now. Then run /opt/lvmshim/check.sh"
-EOF_CONV
+EOF_MENU
 
 # -----------------------------------------------------------------------------
 chmod 755 $D/*.sh $D/*-shim $D/log $D/unlock-web.py
@@ -1418,6 +1080,7 @@ cp -f "$0" /root/luks-pools/luks-kit-install.sh 2>/dev/null || true
 
 systemctl daemon-reload
 $D/install-shims.sh
+mkdir -p /usr/local/sbin && ln -sfn $D/tnas-luks.sh /usr/local/sbin/tnas-luks
 [ -s $D/tls/cert.pem ] && echo "Unlock page certificate $(openssl x509 -noout -fingerprint -sha256 -in $D/tls/cert.pem)"
 echo "$KIT_VERSION" > $D/VERSION
 echo "Kit version $KIT_VERSION installed to $D. Unit: luks-pools.service ($(systemctl is-enabled luks-pools.service 2>/dev/null || echo disabled))"
