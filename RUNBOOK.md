@@ -26,8 +26,8 @@ Files: everything lives in `/opt/lvmshim`. Pools are listed by md UUID in `/opt/
 
 TOS ships with SSH turned off. The browser unlock page (Part B) works without SSH, but SSH is needed to install the kit and is the fallback if the page fails.
 
-1. In the TOS web UI, open Control Panel and turn on the SSH service (under the network or terminal services settings). Keep the default port 9222 unless you change it everywhere below.
-2. From your PC, log in once and confirm you get a root prompt (`#`): `ssh user@<TNAS-IP> -p 9222`.
+1. In the TOS web UI, open Control Panel and turn on the SSH service (under the network or terminal services settings). Keep the default port 22 unless you change it everywhere below.
+2. From your PC, log in once and confirm you get a root prompt (`#`): `ssh grzes@TNAS`. If the prompt ends in `$`, run `sudo -i` first in every step of this runbook.
 3. Confirm SSH starts on its own at boot:
 
 ```bash
@@ -43,11 +43,11 @@ The installer only writes files; it never touches a disk. It is safe to run agai
 **A1. Install or update the kit.** Copy the installer from your PC, then run it on the NAS:
 
 ```bash
-scp -P 9222 luks-kit-install.sh user@<TNAS-IP>:/root/        # on the PC
+scp luks-kit-install.sh grzes@TNAS:/root/        # on the PC
 bash /root/luks-kit-install.sh                    # on the NAS
 ```
 
-It ends with `Kit version 2026-10-25 installed to /opt/lvmshim` and prints the unlock page's certificate fingerprint. For a plain update, continue with A5.
+It ends with `Kit version 2026-11-22 installed to /opt/lvmshim` and prints the unlock page's certificate fingerprint. For a plain update, continue with A5.
 
 **A2. Fresh TOS (clean install) with existing encrypted disks.** A clean install forgets the encrypted pools. Install the kit first with the encrypted disks **out** of the NAS, never the other way round: TOS would otherwise meet a locked array it does not know, and treat it as broken or free.
 
@@ -77,8 +77,8 @@ The NAS boots until SSH and the network are up, then waits before TOS mounts any
 
 | Route | How | Needs |
 | --- | --- | --- |
-| Browser | Open `https://TNAS-IP:8443` (or the NAS IP), type the passphrase, press Unlock | Any device on your network |
-| SSH | `ssh user@<TNAS-IP> -p 9222`, then `/opt/lvmshim/unlock.sh` | SSH enabled |
+| Browser | Open `https://TNAS:8443` (or the NAS IP), type the passphrase, press Unlock | Any device on your network |
+| SSH | `ssh grzes@TNAS`, then `/opt/lvmshim/unlock.sh` | SSH enabled |
 | USB key stick | Plugged in before power-on; unlocks with no input | The NASKEY stick (below) |
 
 After the unlock, TOS starts its storage by itself; the normal web UI comes up about a minute later. Optional: `/opt/lvmshim/check.sh` → ALL CHECKS PASSED.
@@ -146,7 +146,7 @@ After every operation below, run `/opt/lvmshim/check.sh` and expect ALL CHECKS P
 | Disk failure or replacement | TOS UI repair; wait for the resync to finish, then check | Tested (fail, re-add, resync) |
 | Expand a pool (more or larger disks) | TOS UI; afterwards also confirm `cryptsetup status cryptN` shows the larger size | Untested |
 | Change or add a passphrase | `cryptsetup luksChangeKey /dev/mdN` or `luksAddKey`, then refresh the header backup (below) | Standard LUKS |
-| Delete an encrypted pool | Delete its volumes in the UI; `vgchange -an vgN; cryptsetup close cryptN`; remove its UUID from `pools.conf`; then delete the pool in the UI | Untested |
+| Delete an encrypted pool | Delete its shared folders and volume(s) in the UI (keep the pool); `tnas-luks` → 6 (optional crypto-erase); power off, pull its disks, power on; delete the pool in the UI | Menu tested on a simulated NAS |
 
 **Refresh a header backup** after any key change, otherwise check.sh reports `header differs`:
 
@@ -225,6 +225,7 @@ mount -o subvol=@ /dev/vgN/lvN /mnt
 
 | Kit version | Change |
 | --- | --- |
+| 2026-11-22 | Menu tnas-luks (list, check, unlock, encrypt, register, decommission with optional crypto-erase, keys and USB key files, header backups, settings) |
 | 2026-10-25 | Version stamp in `/opt/lvmshim/VERSION`, shown by `check.sh` |
 | 2026-10-19 | `convert-pool.sh` 4K-aligns the LVM data start and test-creates a volume; `check.sh` checks alignment |
 | 2026-10-19 | Unlock page redirects after each attempt, so a reloaded tab can never resend the passphrase |
